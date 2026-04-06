@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            git \
+            make \
+            ldid \
+            dpkg-dev \
+            fakeroot \
+            pkg-config \
+            libssl-dev \
+            libxml2-dev \
+            zip \
+            unzip
+
+      - name: Set up Theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
+
+      - name: Build
+        run: |
+          make package
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: packages/*.deb

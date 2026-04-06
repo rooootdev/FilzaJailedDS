@@ -20,7 +20,6 @@ jobs:
             clang \
             git \
             make \
-            ldid \
             dpkg-dev \
             fakeroot \
             pkg-config \
@@ -28,6 +27,7 @@ jobs:
             libxml2-dev \
             zip \
             unzip
+          brew install ldid
 
       - name: Set up Theos
         run: |

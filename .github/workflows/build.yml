@@ -13,6 +13,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install ldid
+        run: |
+          curl -L https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o /usr/local/bin/ldid
+          chmod +x /usr/local/bin/ldid
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -27,7 +32,6 @@ jobs:
             libxml2-dev \
             zip \
             unzip
-          brew install ldid
 
       - name: Set up Theos
         run: |

@@ -6,6 +6,7 @@
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
 #include "sandbox_escape.h"
+#include "apfs_own.h"
 
 #pragma mark - Root Helper Hooks
 
@@ -204,6 +205,249 @@ static id hook_unZipFilePassword(id self, SEL _cmd, id zipPath, id toPath, id cu
     return hook_unZipFile(self, @selector(unZipFile:toPath:currentDirectory:outMessage:), zipPath, toPath, currentDir, outMsg);
 }
 
+#pragma mark - Apps Manager Fix
+
+// Full Apps Manager fix for sandbox-escaped devices.
+// LSApplicationProxy properties (localizedName, iconsDictionary, dataContainerURL,
+// staticDiskUsage, etc.) return nil without entitlements.
+// Fix: Hook setAppProxy: to populate from Info.plist + filesystem directly.
+// Hook calculateDiskUsage to walk bundle dirs. Hook tap to use bundle path fallback.
+
+@interface LSApplicationProxy : NSObject
++ (id)applicationProxyForIdentifier:(NSString *)bundleId;
+- (NSString *)applicationIdentifier;
+- (NSURL *)bundleURL;
+- (NSURL *)dataContainerURL;
+- (NSString *)localizedName;
+- (NSString *)bundleVersion;
+- (NSString *)shortVersionString;
+- (NSString *)applicationType;
+- (NSDictionary *)iconsDictionary;
+- (NSNumber *)staticDiskUsage;
+- (NSNumber *)dynamicDiskUsage;
+@end
+
+@interface LSApplicationWorkspace : NSObject
++ (id)defaultWorkspace;
+- (NSArray *)allApplications;
+@end
+
+// --- Helper: find app bundle path from bundleId ---
+static NSString *findBundlePath(NSString *bundleId) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *appsDir = @"/var/containers/Bundle/Application";
+    for (NSString *uuid in [fm contentsOfDirectoryAtPath:appsDir error:nil]) {
+        NSString *uuidPath = [appsDir stringByAppendingPathComponent:uuid];
+        for (NSString *item in [fm contentsOfDirectoryAtPath:uuidPath error:nil]) {
+            if (![item hasSuffix:@".app"]) continue;
+            NSString *appPath = [uuidPath stringByAppendingPathComponent:item];
+            NSString *plist = [appPath stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:bundleId]) return appPath;
+        }
+    }
+    // System apps
+    for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
+        if (![item hasSuffix:@".app"]) continue;
+        NSString *appPath = [@"/Applications" stringByAppendingPathComponent:item];
+        NSString *plist = [appPath stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+        if ([info[@"CFBundleIdentifier"] isEqualToString:bundleId]) return appPath;
+    }
+    return nil;
+}
+
+// --- Helper: find data container path ---
+static NSString *findDataContainer(NSString *bundleId) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dataDir = @"/var/mobile/Containers/Data/Application";
+    for (NSString *uuid in [fm contentsOfDirectoryAtPath:dataDir error:nil]) {
+        NSString *uuidPath = [dataDir stringByAppendingPathComponent:uuid];
+        NSString *metaPlist = [uuidPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPlist];
+        if ([meta[@"MCMMetadataIdentifier"] isEqualToString:bundleId]) return uuidPath;
+    }
+    return nil;
+}
+
+// --- Helper: find best icon in bundle ---
+static NSString *findIconPath(NSString *bundlePath, NSDictionary *infoPlist) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // Try CFBundleIcons -> CFBundlePrimaryIcon -> CFBundleIconFiles
+    NSDictionary *icons = infoPlist[@"CFBundleIcons"];
+    NSDictionary *primary = icons[@"CFBundlePrimaryIcon"];
+    NSArray *iconFiles = primary[@"CFBundleIconFiles"];
+    if (!iconFiles) iconFiles = infoPlist[@"CFBundleIconFiles"];
+
+    NSString *bestIcon = nil;
+    unsigned long long bestSize = 0;
+    if (iconFiles.count > 0) {
+        for (NSString *iconName in iconFiles) {
+            // Try exact name and @2x/@3x variants
+            NSArray *variants = @[
+                iconName,
+                [iconName stringByAppendingString:@"@2x.png"],
+                [iconName stringByAppendingString:@"@3x.png"],
+                [iconName stringByAppendingString:@"@2x~iphone.png"],
+                [iconName stringByAppendingString:@"@3x~iphone.png"],
+                [NSString stringWithFormat:@"%@.png", iconName],
+            ];
+            for (NSString *v in variants) {
+                NSString *full = [bundlePath stringByAppendingPathComponent:v];
+                NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+                unsigned long long sz = [attrs fileSize];
+                if (sz > bestSize) { bestSize = sz; bestIcon = full; }
+            }
+        }
+    }
+
+    // Fallback: scan for Icon*.png / AppIcon*.png
+    if (!bestIcon) {
+        for (NSString *file in [fm contentsOfDirectoryAtPath:bundlePath error:nil]) {
+            if (([file hasPrefix:@"Icon"] || [file hasPrefix:@"icon"] || [file hasPrefix:@"AppIcon"])
+                && [file hasSuffix:@".png"]) {
+                NSString *full = [bundlePath stringByAppendingPathComponent:file];
+                NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+                unsigned long long sz = [attrs fileSize];
+                if (sz > bestSize) { bestSize = sz; bestIcon = full; }
+            }
+        }
+    }
+    return bestIcon;
+}
+
+// --- Hook: allApplications fallback ---
+static IMP orig_allApplications = NULL;
+static id hook_allApplications(id self, SEL _cmd) {
+    NSArray *origResult = ((id(*)(id,SEL))orig_allApplications)(self, _cmd);
+    if (origResult && origResult.count > 0) return origResult;
+
+    NSMutableArray *apps = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    void (^scanDir)(NSString *) = ^(NSString *dir) {
+        for (NSString *uuid in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            NSString *uuidPath = [dir stringByAppendingPathComponent:uuid];
+            for (NSString *item in [fm contentsOfDirectoryAtPath:uuidPath error:nil]) {
+                if (![item hasSuffix:@".app"]) continue;
+                NSString *plist = [[uuidPath stringByAppendingPathComponent:item] stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+                NSString *bid = info[@"CFBundleIdentifier"];
+                if (bid) {
+                    id proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:bid];
+                    if (proxy) [apps addObject:proxy];
+                }
+            }
+        }
+    };
+    scanDir(@"/var/containers/Bundle/Application");
+    // System apps (flat structure)
+    for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
+        if (![item hasSuffix:@".app"]) continue;
+        NSString *plist = [[@"/Applications" stringByAppendingPathComponent:item] stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+        NSString *bid = info[@"CFBundleIdentifier"];
+        if (bid) {
+            id proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:bid];
+            if (proxy) [apps addObject:proxy];
+        }
+    }
+    NSLog(@"[Tweak] Apps Manager: found %lu apps via filesystem", (unsigned long)apps.count);
+    return apps;
+}
+
+// --- Hook: setAppProxy: — populate name, icon, paths from filesystem ---
+static IMP orig_setAppProxy = NULL;
+static void hook_setAppProxy(id self, SEL _cmd, id proxy) {
+    // Call original first
+    ((void(*)(id,SEL,id))orig_setAppProxy)(self, _cmd, proxy);
+
+    NSString *bundleId = [self performSelector:NSSelectorFromString(@"bundleId")];
+    if (!bundleId) return;
+
+    NSString *bundlePath = nil;
+    NSString *currentFilePath = [self performSelector:NSSelectorFromString(@"filePath")];
+
+    // Fix filePath if missing or inaccessible
+    if (!currentFilePath || currentFilePath.length == 0) {
+        NSURL *bundleURL = [proxy bundleURL];
+        if (bundleURL) bundlePath = [bundleURL path];
+        if (!bundlePath) bundlePath = findBundlePath(bundleId);
+        if (bundlePath) {
+            ((void(*)(id,SEL,id))objc_msgSend)(self, NSSelectorFromString(@"setFilePath:"), bundlePath);
+        }
+    } else {
+        bundlePath = currentFilePath;
+    }
+
+    // Fix display name — always prefer Info.plist name over proxy
+    if (bundlePath) {
+        NSString *plist = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+        NSString *name = info[@"CFBundleDisplayName"];
+        if (!name) name = info[@"CFBundleName"];
+        if (!name) name = [proxy localizedName];
+        if (!name) name = bundleId;
+        ((void(*)(id,SEL,id))objc_msgSend)(self, NSSelectorFromString(@"setAFileName:"), name);
+    }
+
+    // Fix icon path
+    NSString *iconPath = ((id(*)(id,SEL))objc_msgSend)(self, NSSelectorFromString(@"iconPath"));
+    if (!iconPath && bundlePath) {
+        NSString *plist = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+        NSString *found = findIconPath(bundlePath, info);
+        if (found) {
+            ((void(*)(id,SEL,id))objc_msgSend)(self, NSSelectorFromString(@"setIconPath:"), found);
+        }
+    }
+
+    // Fix document path
+    NSString *docPath = ((id(*)(id,SEL))objc_msgSend)(self, NSSelectorFromString(@"documentPath"));
+    if (!docPath) {
+        NSURL *dataURL = [proxy dataContainerURL];
+        if (dataURL) docPath = [dataURL path];
+        if (!docPath) docPath = findDataContainer(bundleId);
+        if (docPath) {
+            ((void(*)(id,SEL,id))objc_msgSend)(self, NSSelectorFromString(@"setDocumentPath:"), docPath);
+        }
+    }
+
+    // Fix version
+    NSString *ver = ((id(*)(id,SEL))objc_msgSend)(self, NSSelectorFromString(@"version"));
+    if (!ver || ver.length == 0) {
+        ver = [proxy bundleVersion];
+        if (!ver && bundlePath) {
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                [bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            ver = info[@"CFBundleShortVersionString"];
+            if (!ver) ver = info[@"CFBundleVersion"];
+        }
+        if (ver) ((void(*)(id,SEL,id))objc_msgSend)(self, NSSelectorFromString(@"setVersion:"), ver);
+    }
+}
+
+
+// --- Hook: browserView:didSelectItemAtIndexPath: — fallback to bundle path ---
+static IMP orig_didSelectItem = NULL;
+static void hook_didSelectItem(id self, SEL _cmd, id browserView, id indexPath) {
+    // Get the selected item
+    id fileList = ((id(*)(id,SEL))objc_msgSend)(self, NSSelectorFromString(@"fileList"));
+    NSUInteger row = ((NSUInteger(*)(id,SEL))objc_msgSend)(indexPath, @selector(row));
+    id item = ((id(*)(id,SEL,NSUInteger))objc_msgSend)(fileList, NSSelectorFromString(@"objectAtIndex:"), row);
+
+    NSString *docPath = ((id(*)(id,SEL))objc_msgSend)(item, NSSelectorFromString(@"documentPath"));
+    NSString *bundlePath = [item performSelector:NSSelectorFromString(@"filePath")];
+
+    // If documentPath is nil but bundlePath exists, set documentPath to bundlePath
+    // so the original handler can navigate there instead of showing error
+    if (!docPath && bundlePath) {
+        ((void(*)(id,SEL,id))objc_msgSend)(item, NSSelectorFromString(@"setDocumentPath:"), bundlePath);
+    }
+
+    // Call original
+    ((void(*)(id,SEL,id,id))orig_didSelectItem)(self, _cmd, browserView, indexPath);
+}
+
 #pragma mark - License / Integrity Bypass
 
 // Suppress "Main binary was modified" and "Not activated" alerts.
@@ -236,9 +480,58 @@ static void hook_activationViewDidLoad(id self, SEL _cmd) {
     NSLog(@"[Tweak] Suppressed activation nag");
 }
 
+#pragma mark - Auto-chown app bundles on navigate
+
+// Lazy, per-.app chown: when Filza lists any path inside
+// /var/containers/Bundle/Application/<UUID>/<Name>.app[/...], run
+// apfs_own_tree on that .app (one time) to flip everything to 501:501.
+
+static NSMutableSet<NSString *> *g_chowned_apps = nil;
+static dispatch_queue_t g_chown_queue = NULL;
+
+// Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
+// or nil if the path isn't inside one.
+static NSString *app_root_for_path(NSString *path) {
+    if (![path hasPrefix:@"/var/containers/Bundle/Application/"]) return nil;
+    NSArray<NSString *> *comps = [path pathComponents];
+    for (NSUInteger i = 0; i < comps.count; i++) {
+        if ([comps[i] hasSuffix:@".app"]) {
+            return [NSString pathWithComponents:
+                [comps subarrayWithRange:NSMakeRange(0, i + 1)]];
+        }
+    }
+    return nil;
+}
+
+static void ensure_app_chowned_async(NSString *path) {
+    NSString *appRoot = app_root_for_path(path);
+    if (!appRoot) return;
+
+    @synchronized(g_chowned_apps) {
+        if ([g_chowned_apps containsObject:appRoot]) return;
+        [g_chowned_apps addObject:appRoot];
+    }
+
+    dispatch_async(g_chown_queue, ^{
+        NSLog(@"[Tweak] auto-chown: %@", appRoot);
+        apfs_own_tree([appRoot UTF8String], 501, 501);
+    });
+}
+
+static IMP orig_contentsOfDirectory = NULL;
+static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) {
+    if ([path isKindOfClass:[NSString class]]) {
+        ensure_app_chowned_async((NSString *)path);
+    }
+    return ((id(*)(id,SEL,id,NSError**))orig_contentsOfDirectory)(self, _cmd, path, error);
+}
+
 #pragma mark - Hook Installation
 
 static void installHooks(void) {
+    if (!g_chowned_apps) g_chowned_apps = [NSMutableSet new];
+    if (!g_chown_queue) g_chown_queue = dispatch_queue_create("com.filza.autochown", DISPATCH_QUEUE_SERIAL);
+
     Class rfm = NSClassFromString(@"TGRootFileManager");
     if (rfm) {
         Class meta = object_getClass(rfm);
@@ -254,6 +547,13 @@ static void installHooks(void) {
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplySync:fileDescriptor:logintty:"), (IMP)hook_sendObjectWithReplySync_fd_logintty, "@@:@^iB");
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectNoReply:"), (IMP)hook_sendObjectNoReply, "v@:@");
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplyAsync:queue:completion:"), (IMP)hook_sendObjectWithReplyAsync, "v@:@@?");
+
+        // Auto-chown .app on first listing of anything inside it.
+        Method cod = class_getInstanceMethod(rfm, NSSelectorFromString(@"contentsOfDirectoryAtPath:error:"));
+        if (cod) {
+            orig_contentsOfDirectory = method_getImplementation(cod);
+            method_setImplementation(cod, (IMP)hook_contentsOfDirectory);
+        }
     }
     Class zipper = NSClassFromString(@"Zipper");
     if (zipper) {
@@ -286,6 +586,24 @@ static void installHooks(void) {
         }
     }
 
+    // Apps Manager fixes
+    Class lsWorkspace = NSClassFromString(@"LSApplicationWorkspace");
+    if (lsWorkspace) {
+        Method m = class_getInstanceMethod(lsWorkspace, NSSelectorFromString(@"allApplications"));
+        if (m) { orig_allApplications = method_getImplementation(m); method_setImplementation(m, (IMP)hook_allApplications); }
+    }
+    Class appItem = NSClassFromString(@"ApplicationItem");
+    if (appItem) {
+        Method m;
+        m = class_getInstanceMethod(appItem, NSSelectorFromString(@"setAppProxy:"));
+        if (m) { orig_setAppProxy = method_getImplementation(m); method_setImplementation(m, (IMP)hook_setAppProxy); }
+    }
+    Class appsVC = NSClassFromString(@"TGApplicationsViewController");
+    if (appsVC) {
+        Method m = class_getInstanceMethod(appsVC, NSSelectorFromString(@"browserView:didSelectItemAtIndexPath:"));
+        if (m) { orig_didSelectItem = method_getImplementation(m); method_setImplementation(m, (IMP)hook_didSelectItem); }
+    }
+
     NSLog(@"[Tweak] All hooks installed");
 }
 
@@ -303,6 +621,14 @@ static void runExploit(void) {
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
+
+    // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
+    // flip on-disk ownership to mobile before opening. Example:
+    //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
+
+    // Auto-chown runs lazily via the contentsOfDirectoryAtPath: hook: the
+    // first time Filza lists anything inside /var/containers/Bundle/Application/
+    // <UUID>/<Name>.app, apfs_own_tree fires on that .app in the background.
 }
 
 #pragma mark - Entry Point
